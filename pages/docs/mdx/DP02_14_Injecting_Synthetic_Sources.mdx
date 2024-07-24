@@ -1,0 +1,640 @@
+# Injecting Synthetic Sources Into Single-Visit Images
+
+
+Contact author: Jeff Carlin 
+Last verified to run: 2024-06-12 
+LSST Science Pipelines version: Weekly 2024_16 
+Container Size: medium 
+Targeted learning level: advanced 
+
+**Description:** This tutorial demonstrates a method to inject artificial sources (stars and galaxies) into calexp images using the measured point-spread function of the given calexp image. Confirmation that the synthetic sources were correctly injected into the image is done by running a difference imaging task from the pipelines.
+
+**Skills:** Use the `source_injection` tools to inject synthetic sources into images. Create a difference image from a `calexp` with injected sources.
+
+**LSST Data Products:** Butler calexp images and corresponding src catalogs, goodSeeingDiff_templateExp images, and injection_catalogs.
+
+**Packages:** astropy.io, astropy.coordinates, astropy.table, astropy.units, matplotlib, numpy, lsst.afw.display, lsst.afw.table, lsst.daf.base, lsst.daf.butler, lsst.ip.diffim, lsst.source.injection
+
+**Credit:**
+Developed by Jeff Carlin in collaboration with Lee Kelvin and the Rubin Community Science Team. Much of the material is based on the documentation for the LSST [source_injection package](https://pipelines.lsst.io/v/daily/modules/lsst.source.injection/index.html).
+
+**Get Support:**
+Find DP0-related documentation and resources at <a href="https://dp0.lsst.io">dp0.lsst.io</a>.
+Questions are welcome as new topics in the 
+<a href="https://community.lsst.org/c/support/dp0">Support - Data Preview 0 Category</a> 
+of the Rubin Community Forum. 
+Rubin staff will respond to all questions posted there.
+
+## 1. Introduction
+
+This notebook provides a brief introduction to the `source_injection` package from the LSST Science Pipelines. The `source_injection` tools can be used to inject sources into images produced during various stages of Pipelines processing, including visit-level images (e.g., `calexp`s), any dataset with a `datasetType` of `Exposure` (e.g., `postISRCCD` images), and coadd images (e.g., `deepCoadd`s). The main driver that both creates and injects synthetic sources into images is based on [Galsim](https://galsim-developers.github.io/GalSim/), so that the `source_injection` tools enable injection of many types of sources. These include a variety of parameterized galaxy models, stars, and postage stamp images.
+
+This notebook will teach some basics of using the `source_injection` package to insert artificial sources into images. Read the extensive [documentation](https://pipelines.lsst.io/v/daily/modules/lsst.source.injection/index.html) for more details and examples. Furthermore, the [Galsim](https://galsim-developers.github.io/GalSim/) documentation provides much more detail on the types of sources that can be injected.
+
+### 1.1 Import packages
+
+<a href="https://numpy.org">numpy</a> is a commonly used package for scientific computing with arrays in Python.
+
+<a href="https://matplotlib.org/">matplotlib</a> is a library for creating static, animated, and
+interactive visualizations in Python 
+(see also the <a href="https://matplotlib.org/stable/gallery/index.html">matplotlib gallery</a>).
+
+<a href="https://www.astropy.org/">astropy</a> is a package with many common astronomical utilities; here it is used for importing a FITS image, and working with coordinates and tables.
+
+From the `lsst` package, modules for accessing the butler, image display functions, and the source injection utilities are imported (see <a href="https://pipelines.lsst.io/">pipelines.lsst.io</a> for documentation of the Science Pipelines codebase).
+
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from astropy.io import fits
+import astropy.units as u
+from astropy.table import Table, vstack
+from astropy.coordinates import SkyCoord
+import getpass
+
+import lsst.afw.display as afwDisplay
+import lsst.afw.geom as afwGeom
+import lsst.afw.image as afwImage
+import lsst.afw.math as afwMath
+from lsst.daf.butler import Butler
+from lsst.daf.butler.registry import ConflictingDefinitionError
+import lsst.geom as geom
+from lsst.source.injection import ingest_injection_catalog, generate_injection_catalog
+from lsst.source.injection import VisitInjectConfig, VisitInjectTask
+from lsst.ip.diffim.subtractImages import AlardLuptonSubtractTask, AlardLuptonSubtractConfig
+```
+
+### 1.2 Define functions and parameters
+
+Set `afwDisplay` to use `matplotlib`, and use colorblind-friendly colors.
+
+
+```python
+afwDisplay.setDefaultBackend('matplotlib')
+plt.style.use('tableau-colorblind10')
+```
+
+The following function is a modified version of [this code](https://github.com/lsst/atmospec/blob/1e7d6e8e5655cc13d71b21ba866001e6d49ee04e/python/lsst/atmospec/utils.py#L259-L301).
+
+
+```python
+def rotate_exposure(exp, n_degrees):
+    """Rotate an exposure by nDegrees clockwise.
+
+    Parameters
+    ----------
+    exp : `lsst.afw.image.exposure.Exposure`
+        The exposure to rotate
+    n_degrees : `float`
+        Number of degrees clockwise to rotate by
+
+    Returns
+    -------
+    rotated_exp : `lsst.afw.image.exposure.Exposure`
+        A copy of the input exposure, rotated by nDegrees
+    """
+    n_degrees = n_degrees % 360
+
+    wcs = exp.getWcs()
+
+    warper = afwMath.Warper('lanczos4')
+
+    affine_rot_transform = geom.AffineTransform.makeRotation(n_degrees*geom.degrees)
+    transform_p2top2 = afwGeom.makeTransform(affine_rot_transform)
+    rotated_wcs = afwGeom.makeModifiedWcs(transform_p2top2, wcs, False)
+
+    rotated_exp = warper.warpExposure(rotated_wcs, exp)
+    return rotated_exp
+```
+
+## 2. Get an image to inject sources into:
+
+First, retrieve an image to inject sources into. To do so, instantiate a butler pointing to the DP0.2 dataset, identify `calexp` images overlapping a particular `tract`, and retrieve one of those images (plus some of its ancillary data) for later use.
+
+### 2.1 Instantiate a butler
+
+
+```python
+butler_config = 'dp02'
+collections = '2.2i/runs/DP0.2'
+butler = Butler(butler_config, collections=collections)
+```
+
+### 2.2 Identify images overlapping a particular tract and select one
+
+By default the next cell selects images from tract 3828, but you can change this to any tract number that exists in DP0.2 data. (See the map in Figure 15 of ["The DC2 Simulated Sky Survey"](https://ui.adsabs.harvard.edu/abs/2021ApJS..253...31L/abstract) overview paper; also visible in the [DP0.2 documentation](https://dp0-2.lsst.io/data-products-dp0-2/index.html#images)).
+
+Because a `calexp` image only spans one detector, select a single detector (in this case, number 19, but change this if you like) and find images from the chosen tract that contain that detector.
+
+
+```python
+tract = 3828
+where = f"instrument='LSSTCam-imSim' AND skymap='DC2' AND \
+          tract={tract} AND detector=19 AND band='g'"
+calexp_g_DatasetRefs = sorted(list(set(butler.registry.queryDatasets('calexp', where=where))))
+print(f'Identified {len(calexp_g_DatasetRefs)} calexp DatasetRefs')
+```
+
+Use index "5" to select an arbitrary `dataId`.
+Change this index to another integer to select a different image.
+
+
+```python
+dataId_g = calexp_g_DatasetRefs[5].dataId
+print(f"{dataId_g = }")
+```
+
+#### 2.2.1 Retrieve the calexp image
+
+
+```python
+calexp_g = butler.get('calexp', dataId=dataId_g)
+```
+
+#### 2.2.2 Retrieve additional information about the image
+
+To generate synthetic sources to be injected into the image, the coordinates of its bounding box are necessary.
+
+Retrieve the image's WCS and bounding box, and print its central coordinate to the screen:
+
+
+```python
+wcs = calexp_g.getWcs()
+bbox = calexp_g.getBBox()
+print('bounding box: ', bbox)
+
+boxcen = bbox.getCenter()
+cen = wcs.pixelToSky(boxcen)
+sc_cen = SkyCoord(ra=cen[0].asDegrees()*u.deg, dec=cen[1].asDegrees()*u.deg)
+
+print(sc_cen)
+```
+
+#### 2.2.3 Figure out how large the image is on the sky
+
+Note that above the bounding box is roughly 4000 x 4000 pixels.
+
+Use the `bbox.getDimensions` and `wcs.getPixelScale` methods to estimate how large this image is in sky coordinates.
+
+
+```python
+imsize = bbox.getDimensions()[0]*wcs.getPixelScale().asDegrees()
+print('Size of calexp in degrees: ', imsize)
+```
+
+## 3. Make and ingest a catalog of synthetic sources:
+
+Having retrieved a `calexp` image to inject into, now set up a simple synthetic source catalog.
+
+### 3.1 Make a catalog of galaxies and stars
+
+The `source_injection` package provides tools to create catalogs of synthetic sources. Here, use the `generate_injection_catalog` function to create the sources to inject.
+
+Note that the "inject_size" is selected to be 0.1 degrees, or slightly smaller than the size of the image as determined above (inject_size is a radius, so it equals 0.2/2 degrees).
+
+
+```python
+inject_size = 0.2/2
+```
+
+#### 3.1.1 Make a catalog of galaxies to inject
+
+The simplest form of a galaxy in Galsim is parameterized by a [Sersic model](https://en.wikipedia.org/wiki/S%C3%A9rsic_profile): $I(r) = I_e~{\rm exp}\{-b_n [(\frac{r}{r_e})^{1/n}-1]\}$, which defines the shape of the galaxy's light profile as a function of radius (r) in terms of the "Sersic index" (n) and the "half-light radius" ($r_e$). (Note that $n = 1$ corresponds to an exponential profile.)
+
+The above equation results in a circular galaxy. To create elongated (elliptical) Sersic profiles, additionally specify the minor-to-major axis ratio (q) with a rotation angle (beta).
+
+`generate_injection_catalog` will automatically generate sources with all possible permutations of the parameters you provide. For example, the cell below specifies "number=2" to create 2 synthetic galaxies, but then specifies a single magnitude (mag), 3 values of Sersic index (n), 3 values of axis ratio (q), 2 values of beta, and a single value for half_light_radius. This should result in $2*1*3*3*2*1 = 36$ different combinations of those parameters.
+
+Finally, provide minimum and maximum RA and Dec coordinates in degrees. In this case, `generate_injection_catalog` will randomly select positions within those limits.
+
+
+```python
+my_injection_catalog_galaxies = generate_injection_catalog(
+    ra_lim=[sc_cen.ra.value-inject_size, sc_cen.ra.value+inject_size],
+    dec_lim=[sc_cen.dec.value-inject_size, sc_cen.dec.value+inject_size],
+    number=2,
+    seed='3210',
+    source_type="Sersic",
+    mag=[15.0],
+    n=[1, 2, 4],
+    q=[0.9, 0.5, 0.1],
+    beta=[31.0, 144.0],
+    half_light_radius=[15.0],
+)
+```
+
+#### 3.1.2 Make a catalog of stars to inject
+
+Using a similar method, create a catalog of stars to be injected. Specify 5 values of magnitude, with 7 instances, which will result in 35 stars.
+
+
+```python
+my_injection_catalog_stars = generate_injection_catalog(
+    ra_lim=[sc_cen.ra.value-inject_size, sc_cen.ra.value+inject_size],
+    dec_lim=[sc_cen.dec.value-inject_size, sc_cen.dec.value+inject_size],
+    number=7,
+    seed='432',
+    source_type="Star",
+    mag=[16.0, 17.0, 18.0, 19.0, 20.0],
+)
+```
+
+#### 3.1.3 Combine the galaxies and stars into a single synthetic source catalog
+
+In particular, use the [vstack](https://docs.astropy.org/en/stable/table/operations.html#id4) method from Astropy's [Table](https://docs.astropy.org/en/stable/table/index.html) class to combine them.
+
+
+```python
+inject_cat = vstack([my_injection_catalog_galaxies, my_injection_catalog_stars])
+```
+
+
+```python
+inject_cat
+```
+
+### 3.2 Add a postage stamp of an image to the injection catalog
+
+In addition to parameterized sources of many types, a postage-stamp image (for example, an output image from a simulation) can also be injected. This can be any image; the only requirement is that it must be in FITS format and have a valid WCS (see a fun example [here](https://pipelines.lsst.io/v/d_2024_02_27/modules/lsst.source.injection/faqs.html#frequently-asked-questions-and-answers-about-synthetic-source-injection)). This notebook demonstrates injection of an [SDSS g-band image](https://ned.ipac.caltech.edu/byname?objname=NGC+4152&hconst=67.8&omegam=0.308&omegav=0.692&wmap=4&corr_z=1) of the galaxy PGC 038749 downloaded from the NASA/IPAC Extragalactic Database (NED).
+
+Load the image, then display it to see what it depicts:
+
+
+```python
+stamp_img_hdu = fits.open('data/PGC_038749_I_g_bbl2011.fits')
+```
+
+
+```python
+fig = plt.figure()
+plt.subplot()
+im = plt.imshow(stamp_img_hdu[0].data, cmap='gray', vmin=-20.0, vmax=100, origin='lower')
+plt.xlabel('x')
+plt.ylabel('y')
+plt.show()
+```
+
+#### 3.2.1 Create an entry in the injection catalog for the postage stamp image
+
+Add a postage stamp entry into the injection catalog, using `vstack` to add an astropy `Table` containing a single row. Specify its position, magnitude, and "source_type = Stamp," in addition to the filename of the image to inject. (It is OK to leave unnecessary columns empty.)
+
+
+```python
+my_injection_catalog_stamp = Table(
+    {
+        'injection_id': [9999],
+        'ra': [56.622],
+        'dec': [-36.488],
+        'source_type': ['Stamp'],
+        'mag': [14.8],
+        'stamp': ['data/PGC_038749_I_g_bbl2011.fits'],
+    }
+)
+```
+
+
+```python
+inject_cat = vstack([inject_cat, my_injection_catalog_stamp])
+```
+
+
+```python
+inject_cat
+```
+
+#### 3.2.2 Create a rotated version of the stamp image, and add an entry for it into the injection catalog
+
+To apply a rotation to the postage stamp image before injecting it into the `calexp`, use the `rotateExposure` function created above.
+
+The process is to read the image, apply a rotation to it, write it out as a new image, and then follow the same steps as the previous section to add it to the injection catalog.
+
+First, read the postage stamp image using the `afwImage` package. It's OK to ignore the warning about an expected extension type that will pop up.
+
+
+```python
+stamp_img_orig = afwImage.ExposureF.readFits('data/PGC_038749_I_g_bbl2011.fits')
+```
+
+Apply a rotation to the image using the `rotateExposure` function defined above. This will apply a rotation to the WCS, and then "warp" the image (i.e., resample it) onto the new, rotated WCS.
+
+
+```python
+rotation_angle = 57.0
+stamp_img_rotated = rotate_exposure(stamp_img_orig, rotation_angle)
+```
+
+Confirm that the image has been rotated by displaying them side-by-side:
+
+
+```python
+fig, ax = plt.subplots(1, 2, figsize=(6, 4), dpi=150)
+
+plt.sca(ax[0])
+display0 = afwDisplay.Display(frame=fig)
+display0.scale('linear', min=-20, max=150)
+display0.mtv(stamp_img_orig.image)
+plt.title('original stamp image')
+
+plt.sca(ax[1])
+display1 = afwDisplay.Display(frame=fig)
+display1.scale('linear', min=-20, max=150)
+display1.mtv(stamp_img_rotated.image)
+plt.title('rotated stamp image')
+
+plt.tight_layout()
+plt.show()
+```
+
+When the image is rotated, the "empty" pixels are given NaN values. Replace those with zeros (if you leave them as NaNs, the image values will not be read correctly when reading in the resulting image).
+
+
+```python
+stamp_img_rotated.image.array[np.where(np.isnan(stamp_img_rotated.image.array))] = 0.0
+```
+
+Write the rotated stamp to an output file in the home directory.
+
+
+```python
+home_directory = '/home/' + getpass.getuser() + '/'
+stamp_img_rotated.writeFits(home_directory+'stamp_rotated.fits')
+```
+
+Add an entry to the injection catalog for the rotated stamp.
+
+
+```python
+my_injection_catalog_rotated_stamp = Table(
+    {
+        'injection_id': [99999],
+        'ra': [56.642],
+        'dec': [-36.488],
+        'source_type': ['Stamp'],
+        'mag': [14.8],
+        'stamp': [home_directory+'stamp_rotated.fits'],
+    }
+)
+```
+
+
+```python
+inject_cat = vstack([inject_cat, my_injection_catalog_rotated_stamp])
+```
+
+### 3.3 Ingest the synthetic source catalog into a butler collection
+
+#### 3.3.1 Register the source injection collection
+
+The input `inject_cat` will be ingested into a collection called `u/{user}/test_injection_inputs` (where "user" will be the account username) in the butler repository. 
+
+This demonstrates an alternate way to obtain a username (compared to the use of `getpass` demonstrated above).
+
+
+```python
+user = os.getenv("USER")
+```
+
+Define the name of the collection.
+
+> Notice: If an attempt is made to inject synthetic sources into a collection that already exists, the task will complain that the output data already exist on disk. The name assigned to the collection in `INJECTION_CATALOG_COLLECTION` in the following cell must not have been used before. If it has been, choose a new name (or add a unique string, such as a timestamp like `_20240610_1600`, to the end of it) for each rerun.
+
+
+```python
+INJECTION_CATALOG_COLLECTION = f"u/{user}/test_injection_inputs_2"
+```
+
+The collection must be registered in order to use it.
+
+Instantiate a writeable `butler`. Butlers are instantiated in read-only mode by default. By setting the argument `writeable` to `True`, a butler can also be made to be writeable.
+
+> Warning: take care when working with a writeable butler, as data on-disk has the potential to be permanently removed or corrupted.
+
+
+```python
+writeable_butler = Butler(butler_config, writeable=True)
+```
+
+Now ingest the catalog of synthetic sources into the butler collection using the `ingest_injection_catalog` function:
+
+
+```python
+try:
+    my_injected_datasetRefs = ingest_injection_catalog(
+        writeable_butler=writeable_butler,
+        table=inject_cat,
+        band="g",
+        output_collection=INJECTION_CATALOG_COLLECTION,
+    )
+except ConflictingDefinitionError:
+    print(f"Found an existing collection named INJECTION_CATALOG_COLLECTION={INJECTION_CATALOG_COLLECTION}.")
+    print("\nNOTE THAT IF YOU SEE THIS MESSAGE, YOUR CATALOG WAS NOT INGESTED."
+          "\nYou may either continue with the pre-existing catalog, or choose a new"
+          " name and re-run the previous cell and this one to ingest a new catalog.")
+```
+
+## 4. Inject sources into a calexp image
+
+### 4.1 Use source_injection tools to inject sources
+
+The catalog specifying synthetic sources has been ingested into the butler. Now run the task from `source_injection` that injects sources into the `calexp` image that was retrieved earlier.
+
+First, extract the point spread function (PSF), photometric calibration object, and the WCS (World Coordinate System) object associated with the `calexp` image. These will be passed to the injection task so that sources can be injected using the properties of the image itself.
+
+
+```python
+psf = calexp_g.getPsf()
+photo_calib = calexp_g.getPhotoCalib()
+wcs = calexp_g.getWcs()
+```
+
+Load the input injection catalogs that were ingested into the butler in the previous step.
+
+
+```python
+injection_refs = butler.registry.queryDatasets(
+    "injection_catalog",
+    band="g",
+    collections=INJECTION_CATALOG_COLLECTION,
+)
+injection_catalogs = [
+    butler.get(injection_ref) for injection_ref in injection_refs
+]
+```
+
+### 4.2 Instantiate the injection classes
+
+First, instantiate the `VisitInjectConfig` class. The `VisitInjectConfig` class is where configuration of the injection task occurs, allowing for modifications to be made to how the task operates.
+
+Then instantiate the `VisitInjectTask`, using `inject_config` as the configuration argument.
+
+NOTE: For injections into other dataset types, use the appropriate option from the following list:
+```
+from lsst.source.injection import CoaddInjectConfig, CoaddInjectTask
+from lsst.source.injection import ExposureInjectConfig, ExposureInjectTask
+from lsst.source.injection import VisitInjectConfig, VisitInjectTask
+```
+Both `ExposureInject` and `VisitInject` accept dimensions of `("instrument", "visit", "detector")`. They differ in that `ExposureInject` takes a `postISRCCD` exposure (i.e., a raw image that has had "instrument signature removal," or ISR, applied, and no further processing) as an input, while `VisitInject` expects to operate on a `calexp` (an image that has been astrometrically and photometrically calibrated to an external source).
+
+
+```python
+inject_config = VisitInjectConfig()
+
+inject_task = VisitInjectTask(config=inject_config)
+```
+
+### 4.3 Inject sources into an image
+
+Next, execute the `run` method of the `inject_task`.
+
+The `run` method needs the following inputs:
+
+* the input injection catalog
+* the input `calexp`
+* the PSF of the input exposure
+* the WCS information
+* the photometric calibration information
+
+The PSF, WCS, and photo_calib inputs were already retrieved directly from the `calexp` they are associated with.
+
+The inject task provides two outputs:
+
+* the output exposure with sources injected
+* the output source injection catalog
+
+The output source injection catalog is identical to the input, but with two additional columns (x and y) denoting the pixel coordinates of these sources. Note that this catalog is NOT the science catalog containing the full suite of LSST Science Pipelines outputs. To get that, this source injected image will need to be processed by additional Science Pipelines tasks.
+
+> Note: it is best to use a clone of the input `calexp`. This is because the `calexp` that is input for source injection will be edited in-place. Inputting a clone makes it possible to compare the output image to the original `calexp` later in this notebook.
+
+#### 4.3.1 Run the source injection task
+Run the source injection task and extract the "output_exposure" and "output_catalog":
+
+
+```python
+injected_output = inject_task.run(
+    injection_catalogs=injection_catalogs,
+    input_exposure=calexp_g.clone(),
+    psf=psf,
+    photo_calib=photo_calib,
+    wcs=wcs,
+)
+injected_exposure = injected_output.output_exposure
+injected_catalog = injected_output.output_catalog
+```
+
+#### 4.3.2 Compare the images before and after injection
+
+Plot the images side-by-side to confirm that the source injection task successfully added sources to the image.
+
+Note that the injected image will have different flux values than the original, which would cause the image scaling of the two images to be slightly different by default (to confirm this, uncomment the "display0.scale('linear', 'zscale')" lines below and comment out the lines below them that explicitly set the min/max values). For a direct comparison, explicitly set the minimum and maximum pixel values of the color scale.
+
+Additionally, to zoom in on the injected postage stamp to see how it looks in the image, uncomment the line below where it says "To zoom on the PGC 038749 stamp:".
+
+
+```python
+plot_injected_calexp = injected_exposure.clone()
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 6), dpi=150)
+
+plt.sca(ax[0])
+display0 = afwDisplay.Display(frame=fig)
+# display0.scale('linear', 'zscale')
+display0.scale('linear', min=-20, max=150)
+display0.mtv(calexp_g.image)
+plt.title('calexp image')
+
+plt.sca(ax[1])
+display1 = afwDisplay.Display(frame=fig)
+# display1.scale('linear', 'zscale')
+display1.scale('linear', min=-20, max=150)
+display1.mtv(plot_injected_calexp.image)
+# To zoom on the PGC 038749 stamp:
+# display1.mtv(plot_injected_calexp.image[3300:3800, 1500:2000])
+plt.title('injected_calexp image')
+
+plt.tight_layout()
+plt.show()
+```
+
+### 4.4 Create a difference image to see the injected sources
+
+One reason for injecting sources into a `calexp` image might be to test whether they would be recovered in a difference image. This section demonstrates the use of an image differencing task from the LSST Science Pipelines to create a difference image.
+
+#### 4.4.1 Load the template image
+Template images are created as coadds of the images with the best seeing, and are called `goodSeeingDiff_templateExp`. Load the appropriate template corresponding to the `calexp` used throughout this notebook (note the use of the same dataId used to load the `calexp`).
+
+
+```python
+difftemp = 'goodSeeingDiff_templateExp'
+templateExposure = butler.get(difftemp, dataId=dataId_g.required)
+```
+
+#### 4.4.2 Initialize and run the image subtraction task
+
+The first two lines below load the default configuration for the `AlardLuptonSubtract` task, and then initialize the task with that configuration. The task requires (1) a template exposure, (2) the science exposure, and (3) the catalog of sources from the science exposure.
+
+Load the source catalog (`src`) and run the task.
+
+
+```python
+config = AlardLuptonSubtractConfig()
+alTask = AlardLuptonSubtractTask(config=config)
+
+scienceExposure = injected_exposure
+
+sources = butler.get('src', dataId=dataId_g)
+result = alTask.run(templateExposure, scienceExposure, sources)
+```
+
+#### 4.4.3 Compare the original and the difference image
+
+Plot the original `calexp`, the injected image, and the difference image side by side.
+
+Set `xmin`, `xmax`, `ymin`, and `ymax` to zoom in on an arbitrary section of the image.
+Change the values to zoom in on a different region.
+
+
+```python
+xmin, xmax = 500, 2000
+ymin, ymax = 1000, 2500
+
+fig, ax = plt.subplots(1, 3, figsize=(14, 11))
+plt.sca(ax[0])  # set the first axis as current
+display1 = afwDisplay.Display(frame=fig)
+display1.scale('linear', 'zscale')
+display1.mtv(calexp_g.image)
+plt.title('coadd image (template)')
+plt.xlim(xmin, xmax)
+plt.ylim(ymin, ymax)
+plt.sca(ax[1])  # set the second axis as current
+display2 = afwDisplay.Display(frame=fig)
+display2.scale('linear', 'zscale')
+display2.mtv(plot_injected_calexp.image)
+plt.title('calexp with synthetic sources')
+plt.xlim(xmin, xmax)
+plt.ylim(ymin, ymax)
+plt.sca(ax[2])  # set the third axis as current
+display3 = afwDisplay.Display(frame=fig)
+display3.scale('linear', 'zscale')
+display3.mtv(result.difference.image)
+plt.xlim(xmin, xmax)
+plt.ylim(ymin, ymax)
+plt.title('diffim')
+plt.tight_layout()
+plt.show()
+```
+
+# 5. Exercises for the learner
+
+Further explorations could include:
+
+1.  Injecting sources into coadd images.
+2.  Exploring other types of objects that can be injected into images (i.e., other Galsim parameters for more complicated sources).
+3.  Injecting variable objects into multiple calexp images and testing their recoverability.
+4.  Running detection and measurement tasks from the LSST Science Pipelines to test the recovery and measurement accuracy of injected sources (e.g., following DP0.2 tutorial [Notebook 05: Introduction to Source Detection](https://github.com/rubin-dp0/tutorial-notebooks/blob/main/DP02_05_Introduction_to_Source_Detection.ipynb)).
+
+
+```python
+
+```

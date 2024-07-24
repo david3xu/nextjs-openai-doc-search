@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js'
 import { createHash } from 'crypto'
 import dotenv from 'dotenv'
 import { ObjectExpression } from 'estree'
-import { readdir, readFile, stat } from 'fs/promises'
+import { readdir, readFile, writeFile, stat } from 'fs/promises'
 import GithubSlugger from 'github-slugger'
 import { Content, Root } from 'mdast'
 import { fromMarkdown } from 'mdast-util-from-markdown'
@@ -10,13 +10,22 @@ import { mdxFromMarkdown, MdxjsEsm } from 'mdast-util-mdx'
 import { toMarkdown } from 'mdast-util-to-markdown'
 import { toString } from 'mdast-util-to-string'
 import { mdxjs } from 'micromark-extension-mdxjs'
-import 'openai'
-import { Configuration, OpenAIApi } from 'openai'
+// import 'openai'
+// import { Configuration, OpenAIApi } from 'openai'
+import OpenAI from 'openai'
 import { basename, dirname, join } from 'path'
 import { u } from 'unist-builder'
 import { filter } from 'unist-util-filter'
 import { inspect } from 'util'
 import yargs from 'yargs'
+import { OpenAIEmbeddings } from "@langchain/openai"
+import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama"
+import Client from 'openai'
+// import { readFile, writeFile } from 'fs';
+import { promises as fs } from 'fs'
+
+
+
 
 dotenv.config()
 
@@ -246,7 +255,8 @@ class MarkdownEmbeddingSource extends BaseEmbeddingSource {
   }
 
   async load() {
-    const contents = await readFile(this.filePath, 'utf8')
+    const contents = await fs.readFile(this.filePath, 'utf8')
+    console.log(`contents: ${contents}`)
 
     const { checksum, meta, sections } = processMdxForSearch(contents)
 
@@ -272,6 +282,7 @@ async function generateEmbeddings() {
   }).argv
 
   const shouldRefresh = argv.refresh
+  console.log('shouldRefresh', shouldRefresh)
 
   if (
     !process.env.NEXT_PUBLIC_SUPABASE_URL ||
@@ -312,8 +323,19 @@ async function generateEmbeddings() {
   for (const embeddingSource of embeddingSources) {
     const { type, source, path, parentPath } = embeddingSource
 
+    console.log(`[${path}] Generating embeddings...`)
+    console.log(`[${path}] Parent path: ${parentPath}`)
+    console.log(`[${path}] Source: ${source}`)
+    console.log(`[${path}] Type: ${type}`)
+
+
     try {
       const { checksum, meta, sections } = await embeddingSource.load()
+
+      sections.forEach((section) => {
+        console.log("section", section)
+      })
+
 
       // Check for existing page in DB and compare checksums
       const { error: fetchPageError, data: existingPage } = await supabaseClient
@@ -331,19 +353,19 @@ async function generateEmbeddings() {
 
       // We use checksum to determine if this page & its sections need to be regenerated
       if (!shouldRefresh && existingPage?.checksum === checksum) {
-        const existingParentPage = existingPage?.parentPage as Singular<
+        const existingParentPage = existingPage?.parentPage as unknown as Singular<
           typeof existingPage.parentPage
         >
 
         // If parent page changed, update it
-        if (existingParentPage?.path !== parentPath) {
+        if ((existingParentPage as unknown as { path?: string })?.path !== parentPath) {
           console.log(`[${path}] Parent page has changed. Updating to '${parentPath}'...`)
           const { error: fetchParentPageError, data: parentPage } = await supabaseClient
             .from('nods_page')
             .select()
             .filter('path', 'eq', parentPath)
             .limit(1)
-            .maybeSingle()
+            .maybeSingle();
 
           if (fetchParentPageError) {
             throw fetchParentPageError
@@ -420,21 +442,51 @@ async function generateEmbeddings() {
         const input = content.replace(/\n/g, ' ')
 
         try {
-          const configuration = new Configuration({
+
+          const openai = new OpenAI({
             apiKey: process.env.OPENAI_KEY,
-          })
-          const openai = new OpenAIApi(configuration)
+            baseURL: 'http://10.128.138.175:8080/v1',
+            // baseURL: 'http://10.128.138.175:11434/v1',
 
-          const embeddingResponse = await openai.createEmbedding({
-            model: 'text-embedding-ada-002',
-            input,
           })
 
-          if (embeddingResponse.status !== 200) {
-            throw new Error(inspect(embeddingResponse.data, false, 2))
-          }
+          // const openai = new Client({
+          //   apiKey: process.env.OPENAI_KEY,
+          //   baseURL: 'http://10.128.138.175:8080/v1',
+          // });
 
-          const [responseData] = embeddingResponse.data.data
+          console.log("input", input)                               
+          const embeddingResponse = await openai.embeddings.create({
+            model: 'nomic-embed-text:latest',
+            input: [input],
+          })
+          console.log("embeddingResponse", embeddingResponse)
+          // if (embeddingResponse.data[0].status !== 200) {
+          //   throw new Error(inspect(embeddingResponse.data, false, 2))
+          // }
+
+          const responseData = embeddingResponse.data[0].embedding
+          console.log("responseData", responseData)   
+          console.log("embedding length", embeddingResponse.data[0].embedding.length)
+
+
+          // const custom_model = new OpenAIEmbeddings({
+          //   model: 'nomic-embed-text:latest',
+          //   apiKey: process.env.OPENAI_KEY,
+          //   configuration: {
+          //     // baseURL: 'http://10.128.138.175:11434/v1',
+          //     baseURL: 'http://10.128.138.175:8080/v1',
+          //   }
+          // })
+
+          // const custom_model = new OllamaEmbeddings({
+          //   model:'nomic-embed-text:latest',
+          //   baseUrl: 'http://10.128.138.175:11434',
+          // })
+
+
+          // const embeddingResponse = await custom_model.embedDocuments([input])
+          // console.log("embeddingResponse", embeddingResponse)
 
           const { error: insertPageSectionError, data: pageSection } = await supabaseClient
             .from('nods_page_section')
@@ -443,12 +495,12 @@ async function generateEmbeddings() {
               slug,
               heading,
               content,
-              token_count: embeddingResponse.data.usage.total_tokens,
-              embedding: responseData.embedding,
+              token_count: embeddingResponse.usage.total_tokens,
+              embedding: responseData,
             })
             .select()
             .limit(1)
-            .single()
+            .single();
 
           if (insertPageSectionError) {
             throw insertPageSectionError

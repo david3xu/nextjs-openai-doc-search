@@ -1,0 +1,431 @@
+Interactive Image Visualization 
+Contact author(s): Leanne Guy 
+Last verified to run: 2024-05-01 
+LSST Science Pipelines version: Weekly 2024_16
+Container Size: large 
+Targeted learning level: intermediate 
+
+**Description:** Interactive image visualizations with three open-source python libraries.
+
+**Skills:** Visualize exposure images with HoloViews, interact with images with HoloViews Streams and Dynamic Map, and output interactive images to interactive HTML files.
+
+**LSST Data Products:** The calexp and deepCoadd images, Source and Object tables.
+
+**Packages:** bokeh, holoviews
+
+**Credit:**
+This tutorial was inspired by a notebook originally developed by Keith Bechtol in the context of the LSST Stack Club. 
+It has been updated and extended for DP0.1 and DP0.2 by Leanne Guy. Material on how to output an interactive HTML file 
+in Section 3.2 was added by Douglas Tucker.
+
+**Get Support:**
+Find DP0-related documentation and resources at <a href="https://dp0.lsst.io">dp0.lsst.io</a>. 
+Questions are welcome as new topics in the <a href="https://community.lsst.org/c/support/dp0">Support - Data Preview 0 Category</a> of the 
+Rubin Community Forum. Rubin staff will respond to all questions posted there.
+
+## 1. Introduction
+
+The Rubin Science Platform was designed to enable scientific analysis of the LSST data sets, which will be unprecedentedly large and complex. 
+The software and techniques that are best suited for visualizing large data sets might be new to many astronomers.
+This notebook introduces learners with some knowledge of python to two packages that are exceptionally useful for data visualization, holoviews and bokeh, and demonstrates how to use them with the DP0.2 data sets. 
+
+> **Notice:** If the notebook or any interactive features seem to stall, first try going a few cells back and rerunning them in order (the order in which cells are run is imporant for this notebook's functionality). If that does not work, try restarting the kernel. If issues persist, try logging out and restarting the Notebook aspect using a "large" instance of the JupyterLab environment.
+
+> **Warning:** It is not recommended to "Restart Kernel and Run All Cells" in this notebook. Some of the examples require interaction (e.g., for the user to select points on a graph) in order to run correctly.
+
+### 1.1. Package imports
+
+
+```python
+# General
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Astropy
+from astropy.visualization import ZScaleInterval, AsinhStretch
+
+# LSST packages
+from lsst.daf.butler import Butler
+
+# Bokeh
+import bokeh
+from bokeh.io import output_notebook
+from bokeh.models import HoverTool
+
+# HoloViews
+import holoviews as hv
+from holoviews import streams, opts
+from holoviews.operation.datashader import rasterize
+```
+
+Check which versions of bokeh and holoviews and datashader are we working with.
+This is important when referring to online documentation as APIs can change between versions.
+
+
+```python
+print("Bokeh version: " + bokeh.__version__)
+print("HoloViews version: " + hv.__version__)
+```
+
+### 1.2. Define functions and parameters
+
+Set the holoviews plotting library to be bokeh. 
+You will see the holoviews + bokeh icons displayed when the library is loaded successfully.
+
+Set the display output for bokeh plots to be inline, in the notebook.
+
+
+```python
+hv.extension('bokeh')
+output_notebook()
+```
+
+Create a function that converts a butler dataId into a string.
+
+
+```python
+def dataIdToString(dataId: dict) -> str:
+    """
+    Convert a dataId dictionary to a string.
+
+    Parameters
+    ----------
+    dataId: dict
+        dataId as a dictionary
+
+    Returns
+    -------
+    str
+    """
+    output = ''
+    nkeys = len(dataId.items())
+    for i, (key, value) in enumerate(dataId.items()):
+        if i < nkeys - 1:
+            output += str(key) + ": " + str(value) + ", "
+        elif i == nkeys - 1:
+            output += str(key) + ": " + str(value)
+    return output.strip()
+```
+
+## 2. Data preparation
+
+The basis for any data visualization is the underlying data.
+In this tutorial we will work with images.
+
+In this notebook we will access data via <a href="https://pipelines.lsst.io/modules/lsst.daf.butler/index.html">the butler</a>: an LSST Science Pipelines software package that allows you to fetch the LSST data you want without having to know its location or format.
+
+Create a DP0.2. data butler to use in this notebook.
+
+
+```python
+config = 'dp02'
+collection = '2.2i/runs/DP0.2'
+butler = Butler(config, collections=collection)
+```
+
+### 2.1. Retrieve a calexp and the sources in it
+
+Retrieve a calexp from the butler by specifying its visit, detector, and band as the dataId.
+
+
+```python
+calexpId = {'visit': 192350, 'detector': 175, 'band': 'i'}
+calexp = butler.get('calexp', dataId=calexpId)
+
+assert calexp is not None
+
+print('The dataId as a string: "'+dataIdToString(calexpId)+'"')
+
+print('calexp visit: ', calexp.visitInfo.id)
+print('calexp band: ', calexp.filter.bandLabel)
+print('calexp detector: ', calexp.detector.getId())
+```
+
+Get entries in the sourceTable using the same dataId.
+
+
+```python
+calexp_sources = butler.get('sourceTable', dataId=calexpId)
+print(len(calexp_sources))
+```
+
+### 2.2. Retrieve a deepCoadd and the objects in it
+
+Retrieve a deepCoadd from the butler by specifying a tract, patch, and band as the dataId.
+
+
+```python
+coaddId = {'tract': 4226, 'patch': 17, 'band': 'r'}
+coadd = butler.get('deepCoadd', dataId=coaddId)
+
+assert coadd is not None
+```
+
+Option: Get additional information about the deepCoadd.
+In this case, as an example, find out which visits went into constructing it.
+
+
+```python
+coaddInfo = coadd.getInfo()
+coaddVisits = coaddInfo.getCoaddInputs().visits
+coaddVisits.asAstropy()
+```
+
+Get entries in the objectTable using the same dataId.
+
+
+```python
+coadd_objects = butler.get('objectTable', dataId=coaddId)
+print(len(coadd_objects))
+```
+
+### 2.3. Explore the retrieved data
+
+It is always good practice to do a bit of basic characterization for data retrieved from a catalog.
+
+> **Notice:** There are many more entries in the extracted coadd_object table than the calexp_source table, even though they are both about the same sized area (patch-sized and visit-sized, respectively), because the coadd_object table extends to very faint magnitudes.
+
+Show that the two samples, coadd_objects and calexp_sources, do not overlap in sky coordinate and do not have the same apparent magnitude distribution.
+
+First, pull the data to be plotted out of the data frame, and identify coadd_objects that are not flagged.
+
+
+```python
+co_ra = coadd_objects.coord_ra.values
+co_dec = coadd_objects.coord_dec.values
+co_cF = coadd_objects.r_calibFlux.values
+co_cFf = coadd_objects.r_calibFlux_flag.values
+co_diP = coadd_objects.detect_isPrimary.values
+tx = np.where((co_diP) & (co_cF > 0.0) & (co_cFf == 0))[0]
+print('Number of coadd objects to plot: ', len(tx))
+```
+
+Then, make a simple, non-interactive plot to characterize the coordinates and magnitudes of the retrieved cooad_objects and calexp_sources.
+
+> **Notice:** For the purposes of this plotting demonstration it is OK to ignore the RuntimeWarning that appears when the next cell is executed, but for scientific analyses, invalid values should be investigated.
+
+
+```python
+fig, ax = plt.subplots(1, 2, figsize=(14, 4))
+
+ax[0].plot(co_ra[tx], co_dec[tx],
+           'o', ms=1, alpha=0.4, mew=0, label='coadd_objects')
+ax[0].plot(calexp_sources['coord_ra'], calexp_sources['coord_dec'],
+           'o', ms=1, alpha=1, mew=0, label='calexp_sources')
+ax[0].set_xlabel('RA')
+ax[0].set_ylabel('Dec')
+ax[0].legend(markerscale=8)
+
+ax[1].hist(-2.5 * np.log10(co_cF[tx]) + 31.4,
+           histtype='step', lw=2, log=True, label='coadd_objects')
+ax[1].hist(-2.5 * np.log10(calexp_sources['calibFlux']) + 31.4,
+           histtype='step', lw=2, log=True, label='calexp_sources')
+ax[1].set_xlabel('apparent magnitude')
+ax[1].set_ylabel('log(N)')
+ax[1].legend()
+
+plt.show()
+```
+
+## 3. HoloViews
+
+[HoloViews](https://holoviews.org) supports easy analysis and visualization by annotating data rather than utilizing direct calls to plotting packages. For this tutorial, we will use [Bokeh](https://docs.bokeh.org/en/latest/) as the plotting library backend for HoloViews. This is defined in Section 1, above, with the `hv.extension('bokeh')` call.  HoloViews supports several plotting libraries and there is an exercise to the user at the end of this section to explore using Holoviews with other plotting packages. 
+
+The basic core primitives of HoloViews are [Elements](http://holoviews.org/Reference_Manual/holoviews.element.html) (`hv.Element`). Elements are simple wrappers around your data that provide a semantically meaningful visual representation. An Element may be a set of Points, an Image, a Curve, a Histogram, a Scatter, etc. See the HoloViews [Reference Gallery](http://holoviews.org/reference/index.html) for all the various types of Elements that can be created with HoloViews. 
+
+
+### 3.1. Visualizing calexp images with HoloViews
+
+In this first example we will use the HoloViews [Image Element](http://holoviews.org/reference/elements/bokeh/Image.html) to quickly visualize the catalog data retrieved in Section 1 as a scatter plot. HoloViews maintains a strict separation between content and presentation. This separation is achieved by maintaining sets of keyword values as `options` that specify how `Elements` are to appear.  In this first example we will apply the default options and remove the toolbar. 
+
+The beginner-level image-display tutorial notebooks demonstrate how to use the `lsst.afw.display` library to visualize exposure images, and how to use Firefly.
+In this tutorial we demonstrate image visualization at the pixel level with HoloViews.
+
+We will use the holoviews Image Element to visualize a calexp. We will then overlay a HoloViews DynamicMap on the image to compute and display elements dynamically, allowing exploration of large datasets. DynamicMaps generate elements on the fly allowing exploration of parameters with arbitrary resolution. DynamicMaps are lazy in the sense they only compute as much data as the user wishes to explore. An Overlay is a collection of HoloViews objects that are displayed simultaneously, e.g a Curve superimposed on a Scatter plot of data. You can build an Overlay between any two HoloViews objects, which can have different types using the * operator. 
+
+First, we will use the `astropy.visualization` library to define an asinh stretch and zscale interval and apply them to the calexp object. These are the same transformations that were applied in the beginner-level image-display tutorial notebooks.
+
+Apply a asinh/zscale mapping to the data.
+
+
+```python
+transform = AsinhStretch() + ZScaleInterval()
+scaledImage = transform(calexp.image.array)
+```
+
+LSST’s image classes (Image, Mask, MaskedImage, and Exposure) use a pixel indexing convention that is different from both the convention used by `numpy.ndarray` objects and the convention used in FITS images (as documented [here](https://pipelines.lsst.io/modules/lsst.afw.image/indexing-conventions.html)).  Most plotting tools assume pixel (0, 0) is in the upper left where we always assume (0,0) is in the lower left. Consequently, we flip the data array. 
+
+
+```python
+scaledImage = np.flipud(scaledImage)
+bounds_img = (0, 0, calexp.getDimensions()[0], calexp.getDimensions()[1])
+```
+
+Further details can be found at [Image Indexing, Array Views, and Bounding Boxes](https://pipelines.lsst.io/modules/lsst.afw.image/indexing-conventions.html) in the Rubin Science Pipelines and Data Products. 
+
+Define some default plot options for the Image.
+
+
+```python
+img_opts = dict(height=600, width=700, xaxis="bottom",
+                padding=0.01, fontsize={'title': '8pt'},
+                colorbar=True, toolbar='right', show_grid=True,
+                tools=['hover'])
+```
+
+Create the Image element.
+
+
+```python
+img = hv.Image(scaledImage, bounds=bounds_img,
+               kdims=['x', 'y']).opts(
+    cmap="Greys_r", xlabel='X', ylabel='Y',
+    title='DC2 image dataId: "' + dataIdToString(calexpId) + '"',
+    **img_opts)
+```
+
+Display the Image. Use the interactive functionality to zoom in on an interesting galaxy, and watch the image automatically rescale based on the pixel values in the view region.
+
+
+```python
+rasterize(img)
+```
+
+### 3.2. Output interactive image to HTML file
+
+HoloViews permits one to output interactive images like the above to an HTML file, retaining most of the interactive qualities of the original image.
+Thus, one can share an interactive image with colleagues without requiring them to run a Jupyter notebook.
+We note that the interactivity of the HTML file is limited by the proceessing capabilities of relatively simple JavaScript; so not all the interactive functionality of the notebook version is necessarily supported in the HTML file.
+
+Let's output an interactive HTML file for the above interactive image.  We will output it to your home directory.  We will make use of the HoloViews `save` function to output the image to the HTML files.
+
+First, let's construct the output file name:
+
+
+```python
+outputDir = os.path.expanduser('~')
+outputFileBaseName = 'nb06a_plot1.html'
+outputFile = os.path.join(outputDir, outputFileBaseName)
+
+print('The full pathname of the interactive HTML file will be '+outputFile)
+```
+
+And now output the interactive HTML file:
+
+
+```python
+hv.save(img, outputFile, backend='bokeh')
+```
+
+To view the interactive HTML file, navigate to it via the directory listing in the left-hand side panel of this Jupyter notebook graphical interface, and double-click on its name (or control-click or right-click on its name and select "Open").
+
+This will open another tab within JupyterLab, in which one can view the HTML file.
+Since the figure is of an image, the file is fairly large file (about 85 MB), so it will take about 15 seconds to load.
+Once loading is complete, click on the "Trust HTML" button at the top-left of the tab's window.
+You should see an near-duplicate of the interactive image that we produced just above.
+
+You can also download the HTML file to your local computer (control-click or right-click on its name in the file browser at left and select "Download").
+Then load it in a browser window on your local computer and interact with it the same way.
+
+### 3.3. Overlay source detections on the calexp
+
+Now let's overlay the sources on this calexp image. We will use the Points Element for the detections to overlay.
+
+
+```python
+coords = calexp_sources.x, calexp_sources.y
+```
+
+Create a custom hover tool for the sources.
+
+
+```python
+detHoverTool = HoverTool(
+    tooltips=[
+        ('X', '@x{0.2f}'),
+        ('Y', '@y{0.2f}'),
+    ],
+    formatters={
+        'X': 'printf',
+        'Y': 'printf',
+    },
+)
+
+detections = hv.Points(coords).opts(
+    fill_color=None, size=9, color="darkorange",
+    tools=[detHoverTool])
+```
+
+Now we overlay the detected sources on the image. The `*` operator  is used to overlay one Element on to another.
+
+Reset the tools on the image and add a hover on the detections.
+In the image below, mouse-over the sources to get the coordinates of the detections. 
+
+
+```python
+rasterize(img).opts(tools=[]) * detections.opts(tools=[detHoverTool])
+```
+
+### 3.4. Interactive image exploration with HoloViews Streams and DynamicMap
+
+Now let's add some interactive exploration capability using HoloViews [Streams](http://holoviews.org/user_guide/Streaming_Data.html) and [DynamicMap](https://holoviews.org/reference/containers/bokeh/DynamicMap.html). A DynamicMap is an explorable multi-dimensional wrapper around a callable that returns HoloViews objects. The core concept behind a stream is simple: it defines one or more parameters that can change over time that automatically refreshes code depending on those parameter values.
+
+First create a DynamicMap with a box stream so that we can explore selected sections of the image.
+
+
+```python
+boundsxy = (0, 0, 0, 0)
+box = streams.BoundsXY(source=img, bounds=boundsxy)
+dynamicMap = hv.DynamicMap(lambda bounds: hv.Bounds(bounds), streams=[box])
+```
+
+Display the image and overlay the DynamicMap.
+
+
+```python
+rasterize(img).opts(tools=['box_select']) * dynamicMap
+```
+
+Using the interactive callback features on the image plots, such as the box select (hover over tool options and their names will pop-up), we can explore regions of the image.
+Use the box select tool on the image above to select a region and then execute the cell below to get the box boundaries in pixel coordinates. 
+
+
+```python
+box
+```
+
+Below is another version of the image with a [tap stream](http://holoviews.org/reference/streams/bokeh/Tap.html) instead of box select.
+A Tap stream allows you to click or 'tap' a position to interact with a plot.
+Try zooming in on an interesting part of the image generated below, and then 'tap' somewhere to place an 'X' marker.
+
+> **Notice:** The marker is white, and might be invisible if you select to mark a high-flux region.
+
+
+```python
+posxy = hv.streams.Tap(source=img, x=0.5 * calexp.getDimensions()[0],
+                       y=0.5 * calexp.getDimensions()[1])
+marker = hv.DynamicMap(lambda x, y: hv.Points([(x, y)]), streams=[posxy])
+rasterize(img) * marker.opts(color='white', marker='x', size=20)
+```
+
+'X' marks the spot What's the value at that location? Execute the next cell to find out.
+
+
+```python
+print('The scaled/raw value at position (%.3f, %.3f) is %.3f / %.3f' %
+      (posxy.x, posxy.y, scaledImage[-int(posxy.y), int(posxy.x)],
+       calexp.image.array[-int(posxy.y), int(posxy.x)]))
+```
+
+## 4. Exercises for the learner
+
+ 1. HoloViews works with a wide range of plotting libraries, Bokeh, matplotlib, plotly, mpld3, pygal to name a few. You can change the HoloViews plotting library to be `matplotlib` instead of `bokeh` in Section 1 (e.g., `hv.extension('matplotlib')`; notice the holoviews + matplotlib icons displayed when the library is loaded successfully), and try running through Section 3 again. You will encounter some warnings about how certain options "for Image type not valid for selected backend", but you will also see the image display formats change to matplotlib. Try it, or try with some other plotting library. Don't forget to set the plotting library back to whichever you prefer to use for the rest of this tutorial.
+ 
+ 2. In Section 3.1, try using the coadd image instead of the calexp image. 
+ 
+ 3. In Section 3.3, try extracting additional information about the Sources and adding it to the custom hover tool. For example, the corresponding RA/DEC or the PSF flux.
+ 
+ 4. Try using a different stream function to interact with the images in Section 3.4.
+ 
+ 5. Try outputting an interactive HTML file (like what was done in Section 3.2) for the interactive images in Section 3.3 and 3.4.  How much of of the interactive functionality from the notebook version of these images carries over to the HTML files?  (N.B.:  the `box` functionality from Section 3.4 does not seem to be supported in an interactive HTML file.)

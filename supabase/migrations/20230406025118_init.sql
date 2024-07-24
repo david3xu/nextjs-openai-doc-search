@@ -18,21 +18,21 @@ create table "public"."nods_page_section" (
   page_id bigint not null references public.nods_page on delete cascade,
   content text,
   token_count int,
-  embedding vector(1536),
+  embedding vector(4096),
   slug text,
   heading text
 );
 alter table "public"."nods_page_section" enable row level security;
 
 -- Create embedding similarity search functions
-create or replace function match_page_sections(embedding vector(1536), match_threshold float, match_count int, min_content_length int)
+create or replace function match_page_sections(embedding vector(4096), match_threshold float, match_count int, min_content_length int)
 returns table (id bigint, page_id bigint, slug text, heading text, content text, similarity float)
 language plpgsql
 as $$
 #variable_conflict use_variable
 begin
   return query
-  select
+  select 
     nods_page_section.id,
     nods_page_section.page_id,
     nods_page_section.slug,

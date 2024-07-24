@@ -1,0 +1,805 @@
+Introduction to the LSST deblender data products 
+Contact author(s): Christina WIlliams 
+Last verified to run: 2024-05-01 
+LSST Science Pipelines version: Weekly 2024_16 
+Container Size: medium 
+Targeted learning level: beginner 
+
+**Description:** This tutorial introduces the data products created by the LSST multiband deblender (Scarlet; <a href="https://ui.adsabs.harvard.edu/abs/2018A%26C....24..129M/abstract">Melchior et al. 2018</a>) and illustrates some simple use cases for them.
+
+**Skills:** Use of the catalog data products related to deblending objects.
+
+**LSST Data Products:** images (deepCoadd, skyMap, MaskedImage) and catalogs (objectTable)
+
+**Packages:** lsst.afw.image, lsst.afw.detection, lsst.rsp, lsst.daf.butler, lsst.geom
+
+**Credit:** Developed by Christina Willliams in collaboration with Melissa Graham and the Rubin Community Science Team for DP0.2.
+Influenced by Stack Club notebooks demonstrating how to run the LSST deblender (Scarlet; Melchior et al. 2018) by Fred Moolekamp and Alex Drlica-Wagner. 
+
+**Get Support:**
+Find DP0-related documentation and resources at <a href="https://dp0.lsst.io">dp0.lsst.io</a>. Questions are welcome as new topics in the <a href="https://community.lsst.org/c/support/dp0">Support - Data Preview 0 Category</a> of the Rubin Community Forum. Rubin staff will respond to all questions posted there.
+
+## 1. Introduction
+
+This notebook is an introduction to the data products that are associated with the deblending process.
+
+In order to build its source catalog and measure photometry of objects in images, the LSST Science Pipeline uses the multi-wavelength deblending algorithm Scarlet (<a href="https://ui.adsabs.harvard.edu/abs/2018A%26C....24..129M/abstract">Melchior et al. 2018</a>) to identify independent detected components within source blends and separate the flux from independent objects.
+
+A "**parent**" source is identified as a region of connected pixels above a given signal-to-noise ratio (S/N) in the `deepCoadd` image.
+These regions are called footprints.
+Each footprint may have one or more peaks, and it is these peaks that the deblender will use to infer the number and positions of objects blended in each footprint.
+The deblended sub-peaks are referred to as "**children**" of the parent in the properties saved by the deblender in the `Object` table.
+
+The Scarlet deblender separates the flux among components by modeling the flux and shape of each source making up the blend.
+
+This tutorial will identify a heavily blended parent object with many children and explore how to interpret the deblender-related measurements in the `Object` table.
+It will also demonstrate how to use deblender-related columns in the `Object` table to identify unique deblended child sources, and
+provide an example of how to access metadata that is available for each deblended source (e.g. the deblended footprints and pixel-weight maps).
+
+#### Additional resources
+
+An introduction to all of the available deblending flags, and the processes that produce the deblender data products discussed in this tutorial
+can be found in this <a href="https://pipelines.lsst.io/modules/lsst.pipe.tasks/deblending-flags-overview.html">overview of the deblending flags</a>.
+
+A general discussion of blending impacts to LSST can be found in this article titled "<a href="https://lss.fnal.gov/archive/2021/pub/fermilab-pub-21-598-ppd.pdf">The challenge of blending in large sky surveys</a>" by Melchior et al. 2021. 
+
+Some more in-depth presentations on the deblending implementation in the LSST Science Pipelines are available from recorded talks during the Rubin Project and Community Workshop 2022's session on "<a href="https://project.lsst.org/meetings/rubin2022/agenda/deblending-plans-and-challenges">Deblending Plans and Challenges</a>". 
+
+### 1.1. Package Imports
+
+The [matplotlib](https://matplotlib.org/) (and especially sublibrary `matplotlib.pyplot`), [numpy](http://www.numpy.org/), and [astropy](http://www.astropy.org/) libraries are widely used Python libraries for plotting, scientific computing, and astronomical data analysis.
+
+The `lsst.rsp` package provides access to the Table Access Protocol (TAP) service for queries to the DP0 catalogs.
+
+The `lsst.afw.image` and `lsst.afw.detection` packages provide access to some of the extended products created by the deblender pipeline. 
+
+The `lsst.afw.display` library provides access to image visualization routines and the `lsst.daf.butler` library is used to access data products via the butler.
+
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+import lsst.daf.butler as Butler
+from lsst.rsp import get_tap_service
+import lsst.geom as geom
+import lsst.afw.display as afwDisplay
+from lsst.afw.image import MaskedImage
+```
+
+### 1.2. Define functions and parameters
+
+The following two functions enable the visualization of deblended products:
+ 1. `cutout_coadd` will make an image cutout (see DP0.2 tutorial notebook 03a on image display).
+ 2. `heavyFootprint2Image` will help us grab the "footprint" of deblended objects for further analysis.
+
+
+```python
+def cutout_coadd(butler, ra, dec, band='r', datasetType='deepCoadd',
+                 skymap=None, cutoutSideLength=51, **kwargs):
+    """
+    Produce a cutout from a coadd at the given ra, dec position.
+
+    Adapted from DC2 tutorial notebook by Michael Wood-Vasey.
+
+    Parameters
+    ----------
+    butler: lsst.daf.persistence.Butler
+        Helper object providing access to a data repository
+    ra: float
+        Right ascension of the center of the cutout, in degrees
+    dec: float
+        Declination of the center of the cutout, in degrees
+    band: string
+        Filter of the image to load
+    datasetType: string ['deepCoadd']
+        Which type of coadd to load.  Doesn't support 'calexp'
+    skymap: lsst.afw.skyMap.SkyMap [optional]
+        Pass in to avoid the Butler read.  Useful if you have lots of them.
+    cutoutSideLength: float [optional]
+        Size of the cutout region in pixels.
+
+    Returns
+    -------
+    MaskedImage
+    """
+    radec = geom.SpherePoint(ra, dec, geom.degrees)
+    cutoutSize = geom.ExtentI(cutoutSideLength, cutoutSideLength)
+
+    if skymap is None:
+        skymap = butler.get("skyMap")
+
+    tractInfo = skymap.findTract(radec)
+    patchInfo = tractInfo.findPatch(radec)
+    xy = geom.PointI(tractInfo.getWcs().skyToPixel(radec))
+    bbox = geom.BoxI(xy - cutoutSize // 2, cutoutSize)
+    print("bbox = ", bbox, "xy = ", xy, "cutoutSize = ", cutoutSize)
+    patch = tractInfo.getSequentialPatchIndex(patchInfo)
+
+    coaddId = {'tract': tractInfo.getId(), 'patch': patch, 'band': band}
+    parameters = {'bbox': bbox}
+
+    cutout_image = butler.get(datasetType, parameters=parameters,
+                              dataId=coaddId)
+
+    return cutout_image
+```
+
+
+```python
+def heavyFootprint2Image(heavy, fill=np.nan, bbox=None, imageType=MaskedImage):
+    """
+    Create an image of a HeavyFootprint
+    Written by Fred Moolekamp
+
+    Parameters
+    ----------
+    heavy : `HeavyFootprint`
+        The HeavyFootprint to insert into the image
+    fill: number
+        Number to fill the pixels in the image that are not
+        contained in `heavy`.
+    bbox : `Box2I`
+        Bounding box of the output image.
+    imageType : `type`
+        This should be either a `MaskedImage` or `Image` and describes
+        the type of the output image.
+
+    Returns
+    -------
+    image : `lsst.afw.image.MaskedImage` or `lsst.afw.image.Image`
+        An image defined by `bbox` and padded with `fill` that
+        contains the projected flux in `heavy`.
+    """
+    if bbox is None:
+        bbox = heavy.getBBox()
+    image = imageType(bbox, dtype=heavy.getImageArray().dtype)
+    image.set(fill)
+    heavy.insert(image)
+    return image
+```
+
+Define parameters for plotting.
+
+
+```python
+afwDisplay.setDefaultBackend('matplotlib')
+plt.style.use('tableau-colorblind10')
+
+params = {'axes.labelsize': 28,
+          'font.size': 24,
+          'legend.fontsize': 14,
+          'xtick.major.width': 3,
+          'xtick.minor.width': 2,
+          'xtick.major.size': 12,
+          'xtick.minor.size': 6,
+          'xtick.direction': 'in',
+          'xtick.top': True,
+          'lines.linewidth': 3,
+          'axes.linewidth': 3,
+          'axes.labelweight': 3,
+          'axes.titleweight': 3,
+          'ytick.major.width': 3,
+          'ytick.minor.width': 2,
+          'ytick.major.size': 12,
+          'ytick.minor.size': 6,
+          'ytick.direction': 'in',
+          'ytick.right': True,
+          'figure.figsize': [8, 8],
+          'figure.facecolor': 'White'}
+plt.rcParams.update(params)
+```
+
+Start the TAP service.
+
+
+```python
+service = get_tap_service("tap")
+assert service is not None
+```
+
+Instantiate the butler.
+
+
+```python
+butler = Butler.Butler('dp02', collections='2.2i/runs/DP0.2')
+```
+
+## 2. The deblender data products
+
+The object and source catalogs contain a number of columns that can be used to identify and characterize blended sources (parents) that have been deblended into child sources, both of which are ultimately stored in the catalogs along with isolated single sources that do not require deblending.
+These columns help the user identify a unique sample and avoid returning duplicate objects in queries.
+
+In this tutorial we will focus on deblending data products for `Objects` detected and measured in the `deepCoadd` images.
+
+The following describes boolean flags that are set by the deblender, and some measurements or properties of deblended sources that can be used to characterize (de)blended sources.
+
+> **Note:** This tutorial uses catalog data that are available via TAP **and/or** the butler.
+In the DP0-era, some deblending data products are available *only* via butler-based catalogs, and cannot be accessed by TAP and are not listed in the <a href="https://dm.lsst.org/sdm_schemas/browser/dp02.html">DP0.2 Schema Browser</a>.
+
+**Available in the TAP `Object` table and in the butler-based `objectTable`**:
+
+`detect_isPrimary` (boolean): True if source has no children, is in inner region of a coadd patch, and is in the inner region of a coadd tract (i.e., is a unique object in the catalog).  
+Note that an object where `detect_isPrimary`  = True can still be a deblended child, but itself was not a parent that was separated by the deblender. 
+
+> **Warning: to avoid returning duplicates use `detect_isPrimary` = True for all catalog queries.**
+(Duplicates can be caused by including both the parent blend and the nearest child source, or by including the overlapping area outside the "inner region" of a patch or tract.
+
+`detect_fromBlend` (boolean): If True, this source is deblended from a parent with more than one child.
+
+`detect_isIsolated` (boolean): If True, this source was not part of a blend (i.e., the source has a single peak, `deblend_nPeaks` = 1, or its parent only had a single peak, `deblend_parentNPeaks` = 1). 
+
+`detect_isDeblendedSource` (boolean): True if source has no children, is in the inner regions of its coadd patch and tract (will be unique) and is either an unblended isolated source or a deblended child from a parent.
+
+`detect_isDeblendedModelSource` (boolean): True if the source  has no children and is a deblended child (but this flag is false for unblended isolated sources); similar to `detect_isDeblendedSource`.
+ 
+`deblend_skipped` (boolean): If True, the deblender skipped this source and did not attempt to deblend.
+
+`parentObjectId` (long): Unique ID of parent source. 
+
+`deblend_nChild` (int): Number of children this object has (defaults to 0).
+Differs from `deblend_nPeaks` in that `deblend_nChild` excludes both isolated sources and child peaks that were culled during deblending.
+
+`footprintArea` (int): Number of pixels in the source's detection "footprint".
+The footprint itself is a boolean mask of pixels in the input image that were detected as part of the parent blend.
+This corresponds to the footprint for the "reference band".
+
+`refBand` (char): The filter that the deblender identified the "best" location for the centroid of the peak flux based on the multi-wavelength deblending routine (referred to as the "reference filter").
+
+`<f>_blendedness` (dbl): For each filter (f = u, g, r, i, z, or y), a measure of how much the flux is affected by neighbors, (1 - child\_flux/parent\_flux).
+Operates on the absolute value of the pixels to try to obtain a de-noised value.
+See section 4.9.11 of <a href="https://ui.adsabs.harvard.edu/abs/2018PASJ...70S...5B/abstract">Bosch et al. 2018, PASJ, 70, S5</a> for details. 
+
+**Available only in the butler-based `objectTable`**:
+
+`deblend_nPeaks` (int): Number of peaks contained in the parent blend's footprint (is 1 for isolated sources).
+
+`deblend_parentNPeaks` (int): Number of peaks of the deblended child's parent.
+
+### 2.1. Find parents with many children
+
+
+Use the TAP service to find a bunch of parent blended objects.
+
+As with all explorative TAP queries searching for examples, it is essential to first start with a small area while developing queries (to confirm the query is good), and then iteratively increase the area as needed (because the full query could take hours without any spatial constraint on the search). This is because the tables are indexed by coordinate (RA, Dec) and queries with constraints only on measurement columns
+(such as deblending-related parameters) are inefficient.
+In other words, Qserv (the backend hosting the TAP-accessible tables) is "spatially sharded".
+For more information about efficient TAP queries, see tutorial 02.
+
+Search in the center of the DC2 simulation for wide-area (`footprintArea` > 20000, or about 30"x30") parent objects with many children (`deblend_nChild` > 20) that are not point-source like (`refExtendedness` = 1).
+
+
+```python
+ra = 55.064
+dec = -29.783
+query = "SELECT objectId, coord_ra, coord_dec, x, y, tract, patch, " + \
+        "refExtendedness, detect_isPrimary, detect_fromBlend, " + \
+        "deblend_nChild, footprintArea " + \
+        "FROM dp02_dc2_catalogs.Object " + \
+        "WHERE CONTAINS(POINT('ICRS', coord_ra, coord_dec ), " + \
+        "CIRCLE('ICRS', " + str(ra) + ", " + str(dec) + ", 0.2)) = 1 " + \
+        "AND deblend_nChild > 20 AND footprintArea > 20000 " + \
+        "AND refExtendedness = 1"
+parents = service.search(query).to_table()
+parents
+```
+
+Use the `cutout_coadd` function to obtain a cutout image of one of these parents (use parent index `pi=1`).
+Make the side length 3x the square root of the `footprintArea`.
+
+
+```python
+pi = 1
+cutout = cutout_coadd(butler, parents['coord_ra'][pi],
+                      parents['coord_dec'][pi],
+                      band='i', datasetType='deepCoadd',
+                      cutoutSideLength=3.0
+                      * np.sqrt(float(parents['footprintArea'][pi])))
+```
+
+Use TAP to retrieve all children for the selected parent.
+
+
+```python
+query = "SELECT objectId, coord_ra, coord_dec, x, y " + \
+        "FROM dp02_dc2_catalogs.Object " + \
+        "WHERE CONTAINS(POINT('ICRS', coord_ra, coord_dec ), " + \
+        "CIRCLE('ICRS', " + str(ra) + ", " + str(dec) + ", 0.3)) = 1 " + \
+        "AND parentObjectId = " + str(parents['objectId'][pi]) + " " + \
+        "AND detect_isPrimary = 1"
+children = service.search(query).to_table()
+```
+
+Display the `deepCoadd` cutout made for this parent, with a blue cross for the parent and red circles for its children.
+
+
+```python
+fig = plt.figure(figsize=(6, 6))
+display = afwDisplay.Display(frame=fig)
+display.scale('asinh', 'zscale')
+display.mtv(cutout.image)
+with display.Buffering():
+    display.dot('+', parents['x'][pi], parents['y'][pi], ctype=afwDisplay.BLUE)
+    for ci in range(len(children)):
+        display.dot('o', children['x'][ci], children['y'][ci],
+                    size=10, ctype=afwDisplay.RED)
+plt.gca().axis('off')
+display.show_colorbar(False)
+plt.show()
+```
+
+Well Looks like a rich galaxy cluster.
+
+> **Note:** Performance of the deblender is still being optimized, and results like this within DP0 are not necessarily representative of future results.
+
+
+```python
+del parents, children, cutout
+```
+
+### 2.2. Find a parent at a given location
+
+In the case where the user wants to explore the (de)blended objects at a specific location, the process is similar to the one above except here, no constraints are made _except_ spatial constraints.
+
+In this case our search area is limited to a circle of radius 0.003 degrees, or about 10 arcseconds.
+
+
+```python
+ra = 50.1089143
+dec = -44.4812763
+query = "SELECT objectId, coord_ra, coord_dec, x, y, tract, patch, " + \
+        "detect_isPrimary, deblend_nChild, deblend_skipped, " + \
+        "detect_fromBlend, detect_isDeblendedModelSource, " +\
+        "detect_isDeblendedSource, detect_isIsolated, parentObjectId, " + \
+        "footprintArea, z_blendedness " + \
+        "FROM dp02_dc2_catalogs.Object " + \
+        "WHERE CONTAINS(POINT('ICRS', coord_ra, coord_dec ), " + \
+        "CIRCLE('ICRS', " + str(ra) + ", " + str(dec) + ", 0.003)) = 1 "
+table = service.search(query).to_table()
+table
+```
+
+The first row in the results table is a parent source with 13 deblended children (it has `detect_isPrimary` = False, and `deblend_nChild` = 13).
+
+Double check that all of the children are included in the `table` by finding out how many rows have a `parentObjectId` matching the first row's `objectId`.
+
+
+```python
+sel_objid = table['objectId'][0]
+whchild = np.where(table['parentObjectId'] == sel_objid)[0]
+print(len(whchild), "child objects deblended from parentObjectId", sel_objid)
+```
+
+Up until now, the TAP service has been used to access catalog data.
+
+Below, all objects in the same tract and patch as the 13-child parent are obtained via the butler.
+
+
+```python
+tract = table['tract'][0]
+patch = table['patch'][0]
+dataId = {'tract': tract, 'patch': patch, 'band': 'i'}
+obj = butler.get('objectTable', dataId)
+print("Retrieved catalog of ", len(obj), " objects.")
+```
+
+Print the parameters only for the objects that are children of the parent identified above.
+
+
+```python
+children = obj[obj.parentObjectId == sel_objid]
+children[['parentObjectId', 'x', 'y', 'coord_ra', 'coord_dec']]
+```
+
+An alternative way of printing the `children` array defined above.
+
+
+```python
+# for i in range(len(children)):
+#     print(children.iloc[i].parentObjectId, children.index[i],
+#           children.iloc[i].x, children.iloc[i].y,
+#           children.iloc[i].coord_ra, children.iloc[i].coord_dec)
+```
+
+Another alternative for defining separate arrays containing the data from `children`,
+and printing them with a user-specified format.
+
+
+```python
+# obj_parentObjectId = np.asarray(obj.parentObjectId, dtype='int')
+# obj_objectId = np.asarray(obj.index, dtype='int')
+# obj_x = np.asarray(obj.x, dtype='float')
+# obj_y = np.asarray(obj.y, dtype='float')
+# obj_ra = np.asarray(obj.coord_ra, dtype='float')
+# obj_dec = np.asarray(obj.coord_dec, dtype='float')
+
+# wh = np.where(obj_parentObjectId == sel_objid)[0]
+# print(len(wh), "child objects found for parentObjectId", sel_objid)
+
+# for i in wh:
+#     print('%20s %20s %10.3f %9.3f %10.6f %11.6f' %
+#           (obj_parentObjectId[i], obj_objectId[i], obj_x[i], obj_y[i],
+#            obj_ra[i], obj_dec[i]))
+```
+
+Obtain a cutout at the user-specified location.
+
+
+```python
+cutout = cutout_coadd(butler, ra, dec, band='i', datasetType='deepCoadd',
+                      cutoutSideLength=201)
+```
+
+Display a cutout at the location of this parent, and use the object data retrieved from the butler to mark the child locations.
+
+
+```python
+fig = plt.figure(figsize=(6, 6))
+display = afwDisplay.Display(frame=fig)
+display.scale('asinh', 'zscale')
+display.mtv(cutout.image)
+with display.Buffering():
+    display.dot('o', table['x'][0], table['y'][0], size=5,
+                ctype=afwDisplay.YELLOW)
+    for i in range(len(children)):
+        display.dot('o', children.iloc[i].x, children.iloc[i].y,
+                    size=6, ctype=afwDisplay.GREEN)
+plt.gca().axis('off')
+display.show_colorbar(False)
+plt.show()
+```
+
+
+```python
+del table, obj, cutout
+```
+
+## 3. Deblended footprints
+
+Scarlet, when run as part of the LSST Science Pipelines, produces the `deepCoadd_deblendedFlux` data product (among other outputs) after using the multi-wavelength images to identify peaks.
+This data product contains the footprints for the individual deblended children, which might be a useful data product for some users.
+
+The concept of a footprint was introduced in tutorial 05.
+To quote [Bosch et al. (2018)](https://ui.adsabs.harvard.edu/abs/2018PASJ...70S...5B/abstract), 
+
+> *Footprints record the exact above-threshold detection region on a CCD. These are similar to  Source Extractor’s “segmentation map", in that they identify which pixels belong to which detected objects.*
+
+This quote draws an analogy between footprints and segmentation maps, since they both identify pixels with values above some threshold. This is a useful similarity, since it gives us a place to start understanding the properties of footprints.
+
+
+### 3.1. The `deepCoadd_deblendedFlux` table
+
+Below, find the `deepCoadd_deblendedFlux` data product in the butler by searching for all dataset types with the word "blend" in the title.
+
+
+```python
+registry = butler.registry
+for dt in sorted(registry.queryDatasetTypes('*blend*')):
+    print(dt)
+```
+
+Look at the schema for the `deepCoadd_deblendedFlux` catalog to learn more about its contents.
+
+Use the `dataId` as defined above for the 13-child parent galaxy of interest.
+
+
+```python
+dataId
+```
+
+We can first look at the contexts of `deepCoadd_deblendedFlux` by looking at the column names in `deepCoadd_deblendedFlux_schema` without having to pull the contents for the dataID from the butler.
+
+
+```python
+dbFlux_schema = butler.get('deepCoadd_deblendedFlux_schema', dataId=dataId)
+for colname in dbFlux_schema.asAstropy().colnames:
+    print(colname)
+```
+
+Obtain the catalog contents for the `deepCoadd_deblendedFlux` table in the tract and patch defined by our `dataId`.
+
+
+```python
+dbFlux = butler.get('deepCoadd_deblendedFlux', dataId=dataId)
+dbFlux_table = dbFlux.asAstropy()
+print('Retrieved', len(dbFlux_table),
+      'records from the deepCoadd_deblendedFlux table.')
+```
+
+For the 13 children associated with the parent identified in Section 2.2, display the catalog content.
+
+
+```python
+tx = np.where(dbFlux_table['parent'] == sel_objid)[0]
+dbFlux_table[tx]
+```
+
+### 3.2. Exploring deblended footprints
+
+Use the `.getFootprint()` method to get the footprints for all records in `dbFlux`,
+and add them to the astropy table made from the `deepCoadd_deblendedFlux` table.
+A new column called 'footprint' will appear in the `dbFlux_table`.
+
+
+```python
+footprints = [src.getFootprint() for src in dbFlux]
+dbFlux_table["footprint"] = footprints
+```
+
+For the 13 children associated with the parent identified in Section 2.2, display the catalog content, which now contains a `footprint` column (scroll all the way over to the right).
+
+
+```python
+tx = np.where(dbFlux_table['parent'] == sel_objid)[0]
+dbFlux_table[tx]
+```
+
+Use the function `heavyFootprint2Image` to turn the `footprint` into a `heavyFootprint` image. 
+The function returns an image defined by a bounding box, and padded with fill value (the default is `NaN`)
+which contains the projected flux in `heavy`.
+
+The term "heavy" here refers to footprint pixels that aren't simply populated with values 0 or 1
+(where 1 indicates the pixel is part of the footprint),
+but with values that represent the flux.
+
+
+```python
+fpimg = heavyFootprint2Image(dbFlux_table['footprint'][tx[0]])
+```
+
+*Optional:* Explore the properties of `fpimg` by uncommenting the line below, putting your cursor after the period, pressing tab, and scrolling through the pop-up box of attributes.
+Recognize familiar image attributes such as `image` and `getBBox`.
+
+
+```python
+# fpimg.
+```
+
+Display the footprint of each of the 13 deblended children in a 3x5 grid.
+
+Title the subplot with the index and the footprint shape.
+Notice that the footprint image areas are not a standard size: they encompass the footprint.
+
+Remove the axis labels (x and y pixels) and the colorbar scale.
+Note that this grid leaves 2 subplots empty, so erase the axes for the final two subplots.
+
+
+```python
+fig, ax = plt.subplots(3, 5, figsize=(10, 7))
+display = afwDisplay.Display(frame=fig)
+
+x = 0
+for i in range(3):
+    if i < 2:
+        Nc = 5
+    elif i == 2:
+        Nc = 3
+    for j in range(Nc):
+        fpimg = heavyFootprint2Image(dbFlux_table['footprint'][tx[x]])
+        plt.sca(ax[i, j])
+        display.scale('asinh', 'zscale')
+        display.mtv(fpimg.image)
+        display.show_colorbar(False)
+        plt.title(str(x) + " size:" + str(np.shape(fpimg.image.array)),
+                  fontsize=10)
+        plt.gca().axis('off')
+        x += 1
+        del fpimg
+
+plt.sca(ax[2, 3])
+display = afwDisplay.Display(frame=fig)
+plt.gca().axis('off')
+plt.sca(ax[2, 4])
+display = afwDisplay.Display(frame=fig)
+plt.gca().axis('off')
+
+plt.tight_layout()
+plt.show()
+```
+
+The above grid is somewhat useful for seeing the shapes of the individual footprints, but it does not show how the footprints might overlap with each other.
+
+Below, plot all of the footprints together in a single axis. 
+
+Define a set of 13 colormaps to use, one for each child footprint, and label each child footprint 0 through 12.
+
+The `alpha` parameter is used here to set the pixel transparency in a fairly crude way, so that pixels are semi-transparent in the bright (high flux) areas of the footprint, and totally transparent in the outskirts of the footprint.
+
+To make sure the final plot is big enough to hold all footprints, keep track of the min/max x/y values, and then use them to set the plot limits.
+
+> **Note:** Due to the scaling, it *seems* like not all of these footprints touch, but since they are all deblended from a single parent, they do in fact join and overlap.
+Adjust the values of `alpha` or try different `vmin` and `vmax` scaling to explore the footprint edges.
+
+
+```python
+my_colormaps = ['Greys', 'Purples', 'Blues', 'Greens', 'Oranges',
+                'Reds', 'YlOrBr', 'RdPu', 'GnBu', 'YlGnBu',
+                'viridis', 'cividis', 'cool']
+xmin = 9999999.
+xmax = 0.
+ymin = 9999999.
+ymax = 0.
+
+fig = plt.figure(figsize=(6, 6))
+for x in range(len(tx)):
+    fpimg = heavyFootprint2Image(dbFlux_table['footprint'][tx[x]])
+    fpimg_extent = (fpimg.getBBox().beginX, fpimg.getBBox().endX,
+                    fpimg.getBBox().beginY, fpimg.getBBox().endY)
+    alphas = np.asarray(fpimg.image.array,
+                        dtype='float') / np.nanmax(fpimg.image.array)
+    tmp_x = np.where((np.isnan(alphas)) | (alphas < 0.1))
+    alphas[tmp_x] = 0.0
+    tmp_x = np.where(alphas >= 0.1)
+    alphas[tmp_x] = 0.7
+    im = plt.imshow(fpimg.image.array, cmap=my_colormaps[x], alpha=alphas,
+                    vmin=np.nanmin(fpimg.image.array),
+                    vmax=np.nanmax(fpimg.image.array),
+                    extent=fpimg_extent, origin='lower')
+    if xmin > fpimg.getBBox().beginX:
+        xmin = fpimg.getBBox().beginX
+    if xmax < fpimg.getBBox().endX:
+        xmax = fpimg.getBBox().endX
+    if ymin > fpimg.getBBox().beginY:
+        ymin = fpimg.getBBox().beginY
+    if ymax < fpimg.getBBox().endY:
+        ymax = fpimg.getBBox().endY
+    del fpimg, fpimg_extent, alphas, tmp_x, im
+
+    center_x = dbFlux_table['deblend_peak_center_x'][tx[x]]
+    center_y = dbFlux_table['deblend_peak_center_y'][tx[x]]
+    plt.text(center_x, center_y, str(x), fontsize=10)
+
+plt.xlim([xmin, xmax])
+plt.ylim([ymin, ymax])
+plt.xlabel('x', fontsize=10)
+plt.ylabel('y', fontsize=10)
+plt.tick_params(labelsize=10)
+plt.show()
+```
+
+
+```python
+del dataId, dbFlux_schema, dbFlux, dbFlux_table
+del footprints
+```
+
+## 4. Use-case: SN Ia host galaxy identification
+
+DP0 <a href="https://dp0-2.lsst.io/tutorials-examples/portal-images.html">Portal tutorial 03</a> 
+investigated the location of a Type Ia supernova (SN Ia) near a bright host galaxy and found that in some filters,
+and with some image scaling parameters, it seemed like the true host is a fainter host
+that is blended with a bigger, brighter galaxy.
+
+The following steps use the techniques above to look for parent and child sources near this SN Ia.
+
+Define the coordinates for this SN Ia.
+
+
+```python
+sn_ra = 67.4579
+sn_dec = -44.0802
+```
+
+Obtain the i-band `deepCoadd` image, which in Step 2.3 of Portal tutorial 03 reveals a potentially blended host.
+
+
+```python
+cutout = cutout_coadd(butler, sn_ra, sn_dec, band='i', datasetType='deepCoadd',
+                      cutoutSideLength=71)
+```
+
+Get the WCS for this cutout and convert the SN Ia coordinates from RA, Dec to pixels.
+
+
+```python
+wcs = cutout.getWcs()
+sn_radec = geom.SpherePoint(sn_ra, sn_dec, geom.degrees)
+sn_xy = wcs.skyToPixel(sn_radec)
+```
+
+Display the i-band `deepCoadd` with the SN Ia location marked as a pink circle.
+
+See how it seems like there's a faint galaxy there, blended with the larger one?
+
+Try changing the scale from `asinh` to `linear` to get a different view.
+
+
+```python
+fig = plt.figure(figsize=(4, 4))
+display = afwDisplay.Display(frame=fig)
+display.scale('asinh', 'zscale')
+display.mtv(cutout.image)
+with display.Buffering():
+    display.dot('o', sn_xy.getX(), sn_xy.getY(), size=4,
+                ctype=afwDisplay.MAGENTA)
+
+plt.gca().axis('off')
+display.show_colorbar(False)
+plt.show()
+```
+
+Query the `Object` catalog for extended parents in the area. As a reminder, the spatial constraint by searching around a specified ra/dec is not technically necessary, but speeds up the query significantly because of the way the data in the object Table are stored (see Section 2.1).
+
+
+```python
+query = "SELECT objectId, coord_ra, coord_dec, x, y, tract, " + \
+        "patch, refExtendedness, detect_isPrimary, detect_isIsolated, " + \
+        "deblend_nChild, detect_fromBlend, footprintArea, parentObjectId " + \
+        "FROM dp02_dc2_catalogs.Object " + \
+        "WHERE CONTAINS(POINT('ICRS', coord_ra, coord_dec ), " + \
+        "CIRCLE('ICRS', " + str(sn_ra) + ", " + str(sn_dec) + \
+        ", 0.005)) = 1 " + \
+        "AND refExtendedness = 1 AND deblend_nChild > 0"
+parents = service.search(query).to_table()
+parents
+```
+
+The table above reveals there is one nearby parent, with 32 children (identified by the deblend_nChild keyword). The other 5 sources you can see are not blends because they have detect_isIsolated = True.
+
+Plot the location of this parent on the `deepCoadd` to see if it's the bright nearby galaxy.
+
+
+```python
+tx = np.where(parents['deblend_nChild'] == 32)[0]
+print('objectId of parent with 32 children: ', parents['objectId'][tx[0]])
+
+fig = plt.figure(figsize=(4, 4))
+display = afwDisplay.Display(frame=fig)
+display.scale('asinh', 'zscale')
+display.mtv(cutout.image)
+with display.Buffering():
+    display.dot('o', sn_xy.getX(), sn_xy.getY(), size=4,
+                ctype=afwDisplay.MAGENTA)
+    display.dot('o', parents['x'][tx], parents['y'][tx], size=5,
+                ctype=afwDisplay.YELLOW)
+
+plt.gca().axis('off')
+display.show_colorbar(False)
+plt.show()
+```
+
+Query for the 32 children of this parent.
+
+
+```python
+query = "SELECT objectId, coord_ra, coord_dec, x, y, tract, patch, " + \
+        "refExtendedness, detect_isPrimary, deblend_nChild, " + \
+        "detect_fromBlend, footprintArea, parentObjectId " + \
+        "FROM dp02_dc2_catalogs.Object " + \
+        "WHERE CONTAINS(POINT('ICRS', coord_ra, coord_dec ), " + \
+        "CIRCLE('ICRS', " + str(sn_ra) + ", " + str(sn_dec) + \
+        ", 0.01)) = 1 AND parentObjectId = 1252220598734559348"
+children = service.search(query).to_table()
+# children
+```
+
+Plot the locations of the children as green circles.
+
+
+```python
+fig = plt.figure(figsize=(4, 4))
+display = afwDisplay.Display(frame=fig)
+display.scale('asinh', 'zscale')
+display.mtv(cutout.image)
+with display.Buffering():
+    display.dot('o', sn_xy.getX(), sn_xy.getY(), size=4,
+                ctype=afwDisplay.MAGENTA)
+    display.dot('o', parents['x'][tx], parents['y'][tx], size=5,
+                ctype=afwDisplay.YELLOW)
+    for i in range(len(children)):
+        display.dot('o', children['x'][i], children['y'][i], size=3,
+                    ctype=afwDisplay.GREEN)
+
+plt.gca().axis('off')
+display.show_colorbar(False)
+plt.show()
+```
+
+Well What seems to be the true host galaxy has not been deblended from the large, bright, nearby galaxy.
+
+This might be a good case where the deblender should be run, with more aggressive deblending parameters,
+but that is an intermediate/advanced level use of the LSST Science Pipelines that is left to a different tutorial.
+
+## 5. Exercise for the learner
+
+Further explore the footprints of the children around this SN Ia.
+Create a footprints plot similar to the one in Section 3.2.
