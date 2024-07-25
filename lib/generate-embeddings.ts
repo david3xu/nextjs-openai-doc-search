@@ -286,8 +286,8 @@ async function generateEmbeddings() {
 
   if (
     !process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    !process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    !process.env.OPENAI_KEY
+    !process.env.SUPABASE_SERVICE_ROLE_KEY   
+    // !process.env.OPENAI_KEY
   ) {
     return console.log(
       'Environment variables NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and OPENAI_KEY are required: skipping embeddings generation'
@@ -444,7 +444,7 @@ async function generateEmbeddings() {
         try {
 
           const openai = new OpenAI({
-            apiKey: process.env.OPENAI_KEY,
+            apiKey: 'ollama',
             baseURL: 'http://10.128.138.175:8080/v1',
             // baseURL: 'http://10.128.138.175:11434/v1',
 

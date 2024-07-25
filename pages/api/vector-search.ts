@@ -13,7 +13,7 @@ import { OpenAIStream, StreamingTextResponse } from 'ai'
 import { ApplicationError, UserError } from '@/lib/errors'
 import { OpenAI } from 'openai'
 
-const openAiKey = process.env.OPENAI_KEY
+const openAiKey = 'ollama'
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 
@@ -22,7 +22,7 @@ const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 // })
 // const openai = new OpenAIApi(config)
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_KEY,
+  apiKey: 'ollama',
   // baseURL: 'http://10.128.138.175:11434/v1',
   baseURL: 'http://10.128.138.175:8080/v1',
 })
